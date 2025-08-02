@@ -56,3 +56,59 @@ func TestSelectBestNode_ReadyNode(t *testing.T) {
 		t.Errorf("Expected node1, got %s", node)
 	}
 }
+
+func TestCustomQueueHierarchy(t *testing.T) {
+	// Reset rootQueue for test isolation
+	rootQueue.Children = make(map[string]*Queue)
+
+	// Create a custom queue hierarchy
+	err := CreateQueue("root.teamA.subteam1", QueueConfig{Capacity: 30, MaxCapacity: 50, Policy: "fifo"})
+	if err != nil {
+		t.Fatalf("Failed to create custom queue: %v", err)
+	}
+
+	// Pod with custom queue annotation
+	podCustom := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-custom",
+			Namespace: "ns-custom",
+			Annotations: map[string]string{
+				"scheduler.kubernetes.io/queue": "root.teamA.subteam1",
+			},
+		},
+	}
+	// Pod without annotation (should go to root.ns-default)
+	podDefault := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-default",
+			Namespace: "ns-default",
+		},
+	}
+
+	Enqueue(podCustom)
+	Enqueue(podDefault)
+
+	// Check podCustom is in the correct custom queue
+	qCustom := GetQueue("root.teamA.subteam1")
+	if qCustom == nil || len(qCustom.Pods) != 1 || qCustom.Pods[0].Name != "pod-custom" {
+		t.Errorf("pod-custom not found in custom queue")
+	}
+
+	// Check podDefault is in the default namespace queue
+	qDefault := GetQueue("root.ns-default")
+	if qDefault == nil || len(qDefault.Pods) != 1 || qDefault.Pods[0].Name != "pod-default" {
+		t.Errorf("pod-default not found in default namespace queue")
+	}
+
+	// Dequeue from custom queue
+	deqCustom := qCustom.Pods[0]
+	if deqCustom.Name != "pod-custom" {
+		t.Errorf("Expected pod-custom, got %s", deqCustom.Name)
+	}
+
+	// Dequeue from default queue
+	deqDefault := Dequeue("ns-default")
+	if deqDefault == nil || deqDefault.Name != "pod-default" {
+		t.Errorf("Expected pod-default, got %v", deqDefault)
+	}
+}
