@@ -152,16 +152,30 @@ func addResourceLists(a, b v1.ResourceList) v1.ResourceList {
 	return result
 }
 
-// Helper to compare resource usage with capacity
-func isWithinCapacity(usage, total v1.ResourceList, percent int) bool {
+// Helper to compute effective capacity percentage for a queue (relative to root)
+func getEffectiveCapacityPercent(q *Queue) int {
+	percent := q.Config.Capacity
+	parent := q.Parent
+	for parent != nil {
+		percent = percent * parent.Config.Capacity / 100
+		parent = parent.Parent
+	}
+	return percent
+}
+
+// Helper to compare resource usage with effective capacity
+func isWithinCapacity(usage, total v1.ResourceList, queue *Queue) bool {
+	effectivePercent := getEffectiveCapacityPercent(queue)
 	for name, totalQty := range total {
 		capQty := totalQty.DeepCopy()
-		capVal := int64(float64(capQty.Value()) * float64(percent) / 100.0)
+		capVal := int64(float64(capQty.MilliValue()) * float64(effectivePercent) / 100.0)
 		usageQty, ok := usage[name]
 		if !ok {
 			continue
 		}
-		if usageQty.Value() > capVal {
+		// print usageQty and capVal for debugging
+		fmt.Printf("Checking %s: usage=%d, capacity=%d\n", name, usageQty.MilliValue(), capVal)
+		if usageQty.MilliValue() > capVal {
 			return false
 		}
 	}
@@ -186,47 +200,4 @@ func GetClusterTotalResources(clientset kubernetes.Interface) (v1.ResourceList, 
 		}
 	}
 	return total, nil
-}
-
-// Modified SchedulePod to enforce queue capacity
-func SchedulePodWithCapacity(clientset kubernetes.Interface, pod *v1.Pod) {
-	queuePath := pod.Annotations["scheduler.kubernetes.io/queue"]
-	if queuePath == "" {
-		queuePath = fmt.Sprintf("root.%s", pod.Namespace)
-	}
-	queue := GetQueue(queuePath)
-	if queue == nil {
-		return
-	}
-
-	clusterTotal, err := GetClusterTotalResources(clientset)
-	if err != nil {
-		fmt.Printf("Error getting cluster resources: %v\n", err)
-		return
-	}
-	podReq := getPodResourceRequests(pod)
-	futureUsage := addResourceLists(queue.ResourceUsage, podReq)
-	if !isWithinCapacity(futureUsage, clusterTotal, queue.Config.Capacity) {
-		fmt.Printf("Queue %s exceeds capacity, cannot schedule pod %s\n", queuePath, pod.Name)
-		return
-	}
-
-	// If within capacity, proceed to select node and bind
-	selected := Dequeue(pod.Namespace)
-	if selected == nil {
-		return
-	}
-	node, err := SelectBestNode(clientset)
-	if err != nil {
-		fmt.Printf("No suitable node: %v\n", err)
-		return
-	}
-	err = BindPod(clientset, selected, node)
-	if err != nil {
-		fmt.Printf("Binding failed: %v\n", err)
-	} else {
-		fmt.Printf("Bound pod %s to node %s\n", selected.Name, node)
-		// Update queue resource usage
-		queue.ResourceUsage = addResourceLists(queue.ResourceUsage, podReq)
-	}
 }

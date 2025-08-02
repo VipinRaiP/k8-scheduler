@@ -62,3 +62,46 @@ func SchedulePod(clientset kubernetes.Interface, pod *v1.Pod) {
 		fmt.Printf("Bound pod %s to node %s\n", selected.Name, node)
 	}
 }
+
+// SchedulePodWithCapacity enforces queue capacity when scheduling
+func SchedulePodWithCapacity(clientset kubernetes.Interface, pod *v1.Pod) {
+	queuePath := pod.Annotations["scheduler.kubernetes.io/queue"]
+	if queuePath == "" {
+		queuePath = fmt.Sprintf("root.%s", pod.Namespace)
+	}
+	queue := GetQueue(queuePath)
+	if queue == nil {
+		return
+	}
+
+	clusterTotal, err := GetClusterTotalResources(clientset)
+	if err != nil {
+		fmt.Printf("Error getting cluster resources: %v\n", err)
+		return
+	}
+	podReq := getPodResourceRequests(pod)
+	futureUsage := addResourceLists(queue.ResourceUsage, podReq)
+	if !isWithinCapacity(futureUsage, clusterTotal, queue) {
+		fmt.Printf("Queue %s exceeds capacity, cannot schedule pod %s\n", queuePath, pod.Name)
+		return
+	}
+
+	// If within capacity, proceed to select node and bind
+	selected := Dequeue(pod.Namespace)
+	if selected == nil {
+		return
+	}
+	node, err := SelectBestNode(clientset)
+	if err != nil {
+		fmt.Printf("No suitable node: %v\n", err)
+		return
+	}
+	err = BindPod(clientset, selected, node)
+	if err != nil {
+		fmt.Printf("Binding failed: %v\n", err)
+	} else {
+		fmt.Printf("Bound pod %s to node %s\n", selected.Name, node)
+		// Update queue resource usage
+		queue.ResourceUsage = addResourceLists(queue.ResourceUsage, podReq)
+	}
+}

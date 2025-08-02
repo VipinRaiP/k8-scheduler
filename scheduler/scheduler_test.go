@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 )
@@ -57,7 +58,7 @@ func TestSelectBestNode_ReadyNode(t *testing.T) {
 	}
 }
 
-func TestCustomQueueHierarchy(t *testing.T) {
+func TestCustomQueue(t *testing.T) {
 	// Reset rootQueue for test isolation
 	rootQueue.Children = make(map[string]*Queue)
 
@@ -111,4 +112,94 @@ func TestCustomQueueHierarchy(t *testing.T) {
 	if deqDefault == nil || deqDefault.Name != "pod-default" {
 		t.Errorf("Expected pod-default, got %v", deqDefault)
 	}
+}
+
+func TestHierarchicalQueueCapacity(t *testing.T) {
+	// Reset rootQueue for test isolation
+	rootQueue.Children = make(map[string]*Queue)
+
+	// Create a hierarchy: root (100%) -> teamA (50%) -> subteam1 (20%)
+	CreateQueue("root.teamA", QueueConfig{Capacity: 50, MaxCapacity: 100, Policy: "fifo"})
+	CreateQueue("root.teamA.subteam1", QueueConfig{Capacity: 20, MaxCapacity: 100, Policy: "fifo"})
+
+	// Simulate a cluster with 1000m CPU and 2Gi memory
+	clusterResources := v1.ResourceList{
+		v1.ResourceCPU:    resourceMustParse("1000m"),
+		v1.ResourceMemory: resourceMustParse("2Gi"),
+	}
+
+	// Effective capacity for subteam1: 100% * 50% * 20% = 10% of cluster
+	q := GetQueue("root.teamA.subteam1")
+	if q == nil {
+		t.Fatal("subteam1 queue not found")
+	}
+	percent := getEffectiveCapacityPercent(q)
+	if percent != 10 {
+		t.Errorf("Expected effective percent 10, got %d", percent)
+	}
+
+	// Pod requesting 200m CPU, 256Mi memory (should NOT fit, 200m > 100m allowed)
+	pod := &v1.Pod{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{{
+				Resources: v1.ResourceRequirements{
+					Requests: v1.ResourceList{
+						v1.ResourceCPU:    resourceMustParse("200m"),
+						v1.ResourceMemory: resourceMustParse("256Mi"),
+					},
+				},
+			}},
+		},
+	}
+	usage := getPodResourceRequests(pod)
+	q.ResourceUsage = v1.ResourceList{} // reset
+	if isWithinCapacity(usage, clusterResources, q) {
+		t.Error("Pod should NOT fit within subteam1's effective capacity (CPU request too high)")
+	}
+
+	// Pod requesting 200m CPU, 512Mi memory (should NOT fit if over 10%)
+	bigPod := &v1.Pod{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{{
+				Resources: v1.ResourceRequirements{
+					Requests: v1.ResourceList{
+						v1.ResourceCPU:    resourceMustParse("200m"),
+						v1.ResourceMemory: resourceMustParse("512Mi"),
+					},
+				},
+			}},
+		},
+	}
+	// 10% of 2Gi = ~204Mi, so 512Mi > 204Mi
+	usageBig := getPodResourceRequests(bigPod)
+	if isWithinCapacity(usageBig, clusterResources, q) {
+		t.Error("Big pod should NOT fit within subteam1's effective capacity")
+	}
+
+	// Pod requesting 50m CPU, 128Mi memory (should fit)
+	fitPod := &v1.Pod{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{{
+				Resources: v1.ResourceRequirements{
+					Requests: v1.ResourceList{
+						v1.ResourceCPU:    resourceMustParse("50m"),
+						v1.ResourceMemory: resourceMustParse("128Mi"),
+					},
+				},
+			}},
+		},
+	}
+	usageFit := getPodResourceRequests(fitPod)
+	if !isWithinCapacity(usageFit, clusterResources, q) {
+		t.Error("Pod with 50m CPU, 128Mi memory should fit within subteam1's effective capacity")
+	}
+}
+
+// Helper for test: parse resource quantity and panic on error
+func resourceMustParse(s string) resource.Quantity {
+	q, err := resource.ParseQuantity(s)
+	if err != nil {
+		panic(err)
+	}
+	return q
 }
